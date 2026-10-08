@@ -63,7 +63,6 @@ func (r *Reader) ReadValue() (Value, error) {
 }
 
 func (r *Reader) readLine() (string, error) {
-
 	line, err := r.br.ReadString('\n')
 	if err != nil {
 		return "", err
@@ -84,11 +83,10 @@ func (r *Reader) readInt() (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%w: invalid integer %q", ErrProtocol, line)
 	}
-	return n, nil // 42
+	return n, nil
 }
 
 func (r *Reader) readBulk() (Value, error) {
-	// The length line: "5\r\n" -> 5
 	n, err := r.readInt()
 	if err != nil {
 		return Value{}, err
@@ -127,7 +125,6 @@ func (r *Reader) readArray() (Value, error) {
 	elems := make([]Value, 0, n)
 
 	for i := int64(0); i < n; i++ {
-
 		elem, err := r.ReadValue()
 		if err != nil {
 			return Value{}, err
