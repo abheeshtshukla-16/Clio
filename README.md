@@ -8,9 +8,10 @@ that handles `GET`/`SET` with expiry, pub/sub and append-only-file persistence,
 benchmarked against real Redis, with profiling (`pprof`) used to explain any
 performance gap.
 
-> **Status: early development.** The TCP server and the RESP protocol layer
-> (reader and writer) are working. Commands are parsed correctly but not
-> executed yet: every command currently gets `+OK`.
+> **Status: early development.** The TCP server, the RESP protocol layer, a
+> concurrency-safe key-value store and a command dispatcher are working:
+> `PING`, `GET`, `SET` and `DEL` behave like Redis. Expiry, persistence and
+> pub/sub are next.
 
 ---
 
@@ -18,6 +19,7 @@ performance gap.
 
 - [What is Redis, and what is Clio?](#what-is-redis-and-what-is-clio)
 - [Quick start](#quick-start)
+- [Supported commands](#supported-commands)
 - [How it works](#how-it-works)
 - [The RESP protocol](#the-resp-protocol)
 - [Project layout](#project-layout)
@@ -63,7 +65,7 @@ so it never clashes with a real Redis instance).
 
 ```bash
 printf '*1\r\n$4\r\nPING\r\n' | nc localhost 6380
-# +OK
+# +PONG
 ```
 
 **Or with the real Redis client** (`brew install redis`):
@@ -71,6 +73,16 @@ printf '*1\r\n$4\r\nPING\r\n' | nc localhost 6380
 ```bash
 redis-cli -p 6380 SET name Abheesht
 # OK
+redis-cli -p 6380 GET name
+# "Abheesht"
+redis-cli -p 6380 GET city
+# (nil)
+```
+
+**Run the tests** (with Go's race detector):
+
+```bash
+go test ./... -race
 ```
 
 The server logs every parsed command:
@@ -80,6 +92,20 @@ clio listening on localhost:6380
 client connected: 127.0.0.1:54248
 127.0.0.1:54248 sent: ["SET" "name" "Abheesht"]
 ```
+
+---
+
+## Supported commands
+
+| Command | Reply | Example |
+|---|---|---|
+| `PING [message]` | `PONG`, or the message echoed back | `PING` → `PONG` |
+| `SET key value` | `OK` | `SET name Abheesht` → `OK` |
+| `GET key` | the value, or `(nil)` if the key doesn't exist | `GET name` → `"Abheesht"` |
+| `DEL key [key ...]` | how many of the keys existed and were removed | `DEL name ghost` → `(integer) 1` |
+
+Command names are case-insensitive. An unknown command or a wrong number of
+arguments gets an error reply (`-ERR ...`) and the connection stays open.
 
 ---
 
@@ -99,8 +125,8 @@ client connected: 127.0.0.1:54248
  │   resp.Reader   bytes  ──►  Value  ["SET" "name" "Abheesht"]       │
  │        │                                                           │
  │        ▼                                                           │
- │   (dispatcher + handlers: planned; today: "OK")                    │
- │        │                                                           │
+ │   command.Dispatch   Value  ──►  handler  ──►  store  ──►  Value   │
+ │        │             (SET → handleSet → store.Set → +OK)           │
  │        ▼                                                           │
  │   resp.Writer   Value  ──►  bytes  +OK\r\n                         │
  └────────────────────────────────────────────────────────────────────┘
@@ -126,9 +152,22 @@ The `resp` package translates in both directions:
 | `resp.Value` | (none) | the shared in-memory shape both sides agree on |
 
 The `Value` type is the common language between layers: the reader produces
-`Value`s without knowing what commands mean, handlers will consume and return
+`Value`s without knowing what commands mean, handlers consume and return
 `Value`s without ever seeing raw bytes, and the writer encodes any `Value`
 without knowing which command produced it.
+
+### The command layer
+
+`command.Dispatch(store, cmd)` takes one parsed command and returns one reply.
+It checks the command is an array of bulk strings, uppercases the name, looks
+it up in a table of commands, checks the argument count, and calls that
+command's handler. Handlers are the only code that touches the store.
+
+### The store
+
+`store.Store` is a `map[string]string` guarded by a `sync.RWMutex`. One store
+is created in `main` and shared by every connection goroutine, so a `SET` on
+one connection is visible to a `GET` on another.
 
 ---
 
@@ -174,10 +213,14 @@ Clio/
 ├── src/
 │   └── main.go          TCP server: accept loop, one goroutine per connection
 └── internal/
-    └── resp/            the RESP protocol (no networking, no command logic)
-        ├── value.go     Value type, kinds, constructors, readable String()
-        ├── reader.go    bytes → Value
-        └── writer.go    Value → bytes
+    ├── resp/            the RESP protocol (no networking, no command logic)
+    │   ├── value.go     Value type, kinds, constructors, readable String()
+    │   ├── reader.go    bytes → Value
+    │   └── writer.go    Value → bytes
+    ├── store/           the concurrent key-value store
+    │   └── store.go     map + RWMutex: Get, Set, Del, Exists
+    └── command/         the dispatcher
+        └── dispatch.go  command table, argument checks, handlers
 ```
 
 **Why `internal/`?** Go enforces that packages under `internal/` can only be
@@ -194,14 +237,15 @@ As the project grows, sibling packages will join it:
 ```
 internal/
 ├── resp/      RESP encoding and decoding           ✅
-├── server/    connections + command dispatcher    (planned)
-├── store/     the concurrent key-value store      (planned)
+├── store/     the concurrent key-value store      ✅
+├── command/   command dispatcher + handlers       ✅
 ├── pubsub/    subscriptions and message fan-out   (planned)
 └── aof/       append-only-file persistence        (planned)
 ```
 
-The dependency direction is deliberate: `resp`, `store` and `pubsub` depend on
-nothing else in the project; `server` is the only package that sees them all.
+The dependency direction is deliberate: `resp` and `store` depend on nothing
+else in the project; `command` uses both; `src/main.go` wires everything
+together.
 
 ---
 
@@ -264,12 +308,48 @@ Every length in RESP comes from the client. The reader rejects bulk strings
 over 512 MB (Redis's own limit) and oversized arrays, so a malformed or
 malicious `$99999999999` can't make the server allocate unbounded memory.
 
+### The store: one map, one RWMutex
+
+**Chosen:** a single `map[string]string` guarded by a `sync.RWMutex`. Reads
+(`GET`, `EXISTS`) take the shared read lock and can run in parallel; writes
+(`SET`, `DEL`) take the exclusive lock.
+
+**Why:** Go maps are not safe for concurrent use (the runtime aborts on
+concurrent writes), and cache workloads are read-heavy, so letting readers
+share the lock fits the access pattern. The store is created once in `main`
+and passed to each connection (no global).
+
+**Rejected alternatives:**
+- *`sync.Mutex`:* simpler, and about as fast for operations this small, but it
+  serializes readers too.
+- *`sync.Map`:* tuned for keys written once and read many times; loses type
+  safety (values are `any`).
+- *Sharded maps (one lock per shard):* less contention at high core counts;
+  more code than this stage needs.
+- *A single owner goroutine fed by channels:* the closest to real Redis's
+  single-threaded design, but every operation pays a channel round-trip.
+
+### The dispatcher: a command table
+
+**Chosen:** a map from command name to a `spec` (handler function plus
+minimum and maximum argument counts). `Dispatch` is a pure function, `Value`
+in and `Value` out, so it's tested without any network.
+
+**Why:** adding a command is one handler and one table line; argument checks
+and error messages live in one place, so every command behaves consistently.
+
+**Rejected alternatives:**
+- *A `switch` on the command name:* simplest for a handful of commands, but
+  grows long and can't carry per-command metadata.
+- *Handlers writing directly to the connection:* allows streaming large
+  replies, but couples command logic to networking and makes tests harder.
+
 ### Protocol errors close the connection
 
 If a client sends bytes that aren't valid RESP, the server replies with an
 error and **closes the connection**: after garbage, there's no reliable way to
-know where the next command begins. Command-level errors (such as wrong
-arguments) will reply with an error and keep the connection open, since the
+know where the next command begins. Command-level errors (an unknown command,
+wrong arguments) reply with an error and keep the connection open, since the
 stream is still in sync.
 
 ---
