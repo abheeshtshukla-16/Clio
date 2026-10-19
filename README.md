@@ -13,7 +13,8 @@ performance gap.
 > append-only-file persistence are working: `PING`, `GET`, `SET` (with
 > `EX`/`PX`/`PXAT`), `DEL`, `EXISTS`, `EXPIRE`, `PEXPIREAT`, `TTL`, `PTTL` and
 > `PERSIST` behave like Redis, and data survives a restart. Pub/sub works
-> with `SUBSCRIBE`, `UNSUBSCRIBE` and `PUBLISH`.
+> with `SUBSCRIBE`, `UNSUBSCRIBE` and `PUBLISH`, and Clio is benchmarked
+> against real Redis (see [Performance](#performance)).
 
 ---
 
@@ -25,6 +26,7 @@ performance gap.
 - [How it works](#how-it-works)
 - [The RESP protocol](#the-resp-protocol)
 - [Project layout](#project-layout)
+- [Performance](#performance)
 - [Design decisions](#design-decisions)
 
 ---
@@ -68,6 +70,7 @@ so it never clashes with a real Redis instance) and persists writes to
 |---|---|---|
 | `-addr` | `localhost:6380` | address to listen on |
 | `-aof` | `clio.aof` | append-only file; `-aof ""` runs purely in memory |
+| `-pprof` | (off) | serve Go profiling data, e.g. `-pprof localhost:6060` |
 
 **Talk to it with netcat**, sending raw RESP bytes:
 
@@ -263,6 +266,8 @@ Clio/
 │   ├── main.go          flags, AOF replay, expiry sweeper, accept loop
 │   ├── conn.go          one connection: read, handle (incl. pub/sub), reply
 │   └── conn_test.go     end-to-end tests over real TCP
+├── scripts/
+│   └── bench.sh         Clio vs Redis with redis-benchmark
 └── internal/
     ├── resp/            the RESP protocol (no networking, no command logic)
     │   ├── value.go     Value type, kinds, constructors, readable String()
@@ -308,6 +313,50 @@ The dependency direction is deliberate: `resp` and `store` depend on nothing
 else in the project; `command` uses both; `aof` uses only `resp`;
 `src/main.go` wires everything together. The engine doesn't import `aof`: it
 depends on a one-method `Log` interface that `*aof.AOF` happens to satisfy.
+
+---
+
+## Performance
+
+`scripts/bench.sh` runs `redis-benchmark` against real Redis 8.10 and Clio side
+by side, with the same persistence settings (append-only file, fsync every
+second): 200,000 requests from 50 concurrent clients, without pipelining and
+with 16 commands per round trip. Apple M3, 8 cores, both on localhost.
+
+```bash
+brew install redis
+./scripts/bench.sh
+```
+
+| Server | Pipeline | SET req/s | GET req/s |
+|---|---|---|---|
+| Redis | 1 | 222,000 | 229,000 |
+| Clio | 1 | 142,000 | 201,000 |
+| Redis | 16 | 1,198,000 | 2,469,000 |
+| Clio | 16 | 917,000 | 2,667,000 |
+
+### How we got there: measure, profile, fix
+
+The first run was far behind with pipelining (SET 194k/s, GET 662k/s). A CPU
+profile taken through `-pprof` showed about 80% of the time inside `write()`
+system calls, from two causes:
+
+1. **One socket write per reply.** A client sending 16 pipelined commands got
+   16 separate `write()` calls back. Fix: queue replies and flush only when the
+   reader has no more buffered input (`reader.Buffered() == 0`). Pipelined GET
+   went from 662k/s to 2.6M/s.
+2. **One file write per logged command, under the engine lock.** Fix: a
+   *group commit*. `Append` only fills a memory buffer, and each connection
+   pushes the AOF buffer to the OS right before flushing its replies, so a
+   client still never sees `OK` for a write the OS doesn't have. Pipelined SET
+   went from 342k/s to 917k/s. A `kill -9` test confirmed every acknowledged
+   write survives.
+
+The remaining gap without pipelining is the design itself: every request
+costs one `read()` and one `write()`, plus a goroutine being parked and woken
+on another OS thread (about a third of the CPU profile). Real Redis serves
+every socket from one thread in an event loop, so it pays no scheduler cost
+and batches the AOF write for all clients at once.
 
 ---
 
@@ -360,7 +409,8 @@ built through them are always well-formed.
 
 Both the reader and the writer wrap the connection in `bufio`. Reading takes
 large chunks from the OS and hands out single bytes and lines from memory;
-writing collects a whole reply and sends it with one `Flush()`. This cuts
+writing collects replies and sends them with one `Flush()` once the client's
+pipelined commands are all answered. This cuts
 system calls dramatically, and it's what makes **pipelining** work: several
 commands arriving in one read are parsed one at a time from the buffer.
 
@@ -449,8 +499,9 @@ rewriting old data), and reusing RESP means the file needs no new format. The
 same `resp.Reader` that parses network input parses the file, and the same
 engine that serves clients rebuilds the data.
 
-**What can be lost:** a process crash (even `kill -9`) loses nothing, because
-each write has already been handed to the operating system. A machine crash or
+**What can be lost:** a process crash (even `kill -9`) loses nothing that was
+acknowledged, because a connection hands its logged writes to the operating
+system before sending the replies. A machine crash or
 power cut can lose up to the last second, since that's how often the OS is
 told to put the data on the disk itself (`fsync`).
 
