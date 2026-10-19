@@ -505,9 +505,13 @@ system before sending the replies. A machine crash or
 power cut can lose up to the last second, since that's how often the OS is
 told to put the data on the disk itself (`fsync`).
 
-**Known gaps, on purpose:** the file grows forever (real Redis periodically
-*rewrites* it into the shortest equivalent set of commands), and a half-written
-last command after a power cut is simply ignored on the next replay.
+**A half-written last command** (the process died mid-write) is cut off on the
+next startup, so new appends start from a clean boundary. Without the cut, the
+next command would be glued onto the broken bytes and the file could never be
+read again.
+
+**Known gap, on purpose:** the file grows forever. Real Redis periodically
+*rewrites* it into the shortest set of commands that rebuilds the same data.
 
 **Rejected alternatives:**
 - *Snapshots (like Redis's RDB):* compact and fast to load, but anything since

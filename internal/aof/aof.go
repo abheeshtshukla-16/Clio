@@ -86,8 +86,19 @@ func (a *AOF) Close() error {
 	return a.file.Close()
 }
 
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
 func Replay(path string, apply func(resp.Value) error) (int, error) {
-	file, err := os.Open(path)
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
 	}
@@ -96,12 +107,14 @@ func Replay(path string, apply func(resp.Value) error) (int, error) {
 	}
 	defer file.Close()
 
-	reader := resp.NewReader(file)
+	counter := &countingReader{r: file}
+	reader := resp.NewReader(counter)
+	var complete int64
 	count := 0
 	for {
 		cmd, err := reader.ReadValue()
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return count, nil
+			break
 		}
 		if err != nil {
 			return count, err
@@ -110,5 +123,12 @@ func Replay(path string, apply func(resp.Value) error) (int, error) {
 			return count, err
 		}
 		count++
+		complete = counter.n - int64(reader.Buffered())
 	}
+
+	if complete < counter.n {
+		log.Printf("aof: dropping an incomplete command (%d bytes) at the end of %s", counter.n-complete, path)
+		return count, file.Truncate(complete)
+	}
+	return count, nil
 }
