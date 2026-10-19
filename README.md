@@ -9,9 +9,10 @@ benchmarked against real Redis, with profiling (`pprof`) used to explain any
 performance gap.
 
 > **Status: early development.** The TCP server, the RESP protocol layer, a
-> concurrency-safe key-value store and a command dispatcher are working:
-> `PING`, `GET`, `SET`, `DEL` and `EXISTS` behave like Redis. Expiry, persistence and
-> pub/sub are next.
+> concurrency-safe key-value store, a command dispatcher and key expiry are
+> working: `PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`, `EXISTS`, `EXPIRE`,
+> `TTL`, `PTTL` and `PERSIST` behave like Redis. Persistence and pub/sub are
+> next.
 
 ---
 
@@ -100,10 +101,14 @@ client connected: 127.0.0.1:54248
 | Command | Reply | Example |
 |---|---|---|
 | `PING [message]` | `PONG`, or the message echoed back | `PING` → `PONG` |
-| `SET key value` | `OK` | `SET name Abheesht` → `OK` |
+| `SET key value [EX seconds \| PX milliseconds]` | `OK`; a plain `SET` removes any existing expiry | `SET session abc EX 60` → `OK` |
 | `GET key` | the value, or `(nil)` if the key doesn't exist | `GET name` → `"Abheesht"` |
 | `DEL key [key ...]` | how many of the keys existed and were removed | `DEL name ghost` → `(integer) 1` |
 | `EXISTS key [key ...]` | how many of the keys exist (a repeated key counts each time) | `EXISTS name name ghost` → `(integer) 2` |
+| `EXPIRE key seconds` | `1` if the expiry was set, `0` if the key doesn't exist; `0` or a negative time deletes the key | `EXPIRE name 30` → `(integer) 1` |
+| `TTL key` | seconds left, `-1` if the key has no expiry, `-2` if it doesn't exist | `TTL session` → `(integer) 58` |
+| `PTTL key` | like `TTL`, in milliseconds | `PTTL session` → `(integer) 57980` |
+| `PERSIST key` | `1` if an expiry was removed, `0` otherwise | `PERSIST session` → `(integer) 1` |
 
 Command names are case-insensitive. An unknown command or a wrong number of
 arguments gets an error reply (`-ERR ...`) and the connection stays open.
@@ -166,7 +171,8 @@ command's handler. Handlers are the only code that touches the store.
 
 ### The store
 
-`store.Store` is a `map[string]string` guarded by a `sync.RWMutex`. One store
+`store.Store` is a map from key to an entry (the value plus an optional expiry
+time), guarded by a `sync.RWMutex`. One store
 is created in `main` and shared by every connection goroutine, so a `SET` on
 one connection is visible to a `GET` on another.
 
@@ -220,7 +226,7 @@ Clio/
     │   ├── reader_test.go
     │   └── writer.go    Value → bytes
     ├── store/           the concurrent key-value store
-    │   ├── store.go     map + RWMutex: Get, Set, Del, Exists
+    │   ├── store.go     map + RWMutex: Get, Set, Del, Exists, expiry
     │   └── store_test.go
     └── command/         the dispatcher
         ├── dispatch.go  command table, argument checks, handlers
@@ -332,6 +338,39 @@ and passed to each connection (no global).
   more code than this stage needs.
 - *A single owner goroutine fed by channels:* the closest to real Redis's
   single-threaded design, but every operation pays a channel round-trip.
+
+### Expiry: lazy checks plus a sampling sweeper
+
+**Chosen:** each entry stores an absolute `expiresAt` time (zero means "never").
+Expiry is enforced in two ways, the same two Redis uses:
+
+- **Lazily, on access:** every read checks `expiresAt` first, so an expired key
+  is invisible to `GET`, `EXISTS`, `TTL` and friends the instant its time
+  passes. Reads only *skip* expired keys; they don't delete them, so they keep
+  taking the shared read lock and still run in parallel.
+- **Actively, in the background:** a goroutine wakes every 100 ms, samples up
+  to 20 keys and deletes the expired ones. If more than a quarter of the sample
+  was expired, it immediately samples again. This reclaims memory from keys
+  nobody reads any more.
+
+**Why an absolute time, not a countdown:** a deadline never needs updating;
+"time left" is computed on demand as `expiresAt - now`.
+
+**Why sample instead of scanning everything:** the sweep holds the write lock.
+Scanning a million keys would stall every client; checking 20 keys at a time
+keeps each pause tiny, and lazy checks already guarantee correctness.
+
+**Testing time:** the store reads the clock through a `now` function field
+(normally `time.Now`). Tests swap in a fake clock and move it forward, so expiry
+is tested exactly and instantly, with no `sleep`.
+
+**Rejected alternatives:**
+- *A timer (`time.AfterFunc`) per key:* simple to reason about, but a million
+  keys means a million runtime timers.
+- *Lazy deletion inside `GET`:* deleting needs the exclusive lock, so every
+  read would risk upgrading from a read lock to a write lock.
+- *A min-heap ordered by expiry time:* finds the next key to expire exactly,
+  but needs updating on every `SET`/`EXPIRE`/`PERSIST`.
 
 ### The dispatcher: a command table
 

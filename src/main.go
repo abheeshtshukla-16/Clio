@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"clio/internal/command"
 	"clio/internal/resp"
@@ -24,6 +25,8 @@ func main() {
 
 	st := store.New()
 
+	go sweepExpired(st)
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -31,6 +34,13 @@ func main() {
 			continue
 		}
 		go handleConnection(conn, st)
+	}
+}
+
+func sweepExpired(st *store.Store) {
+	for range time.Tick(100 * time.Millisecond) {
+		for st.DeleteExpired(20) > 5 {
+		}
 	}
 }
 
