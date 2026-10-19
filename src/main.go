@@ -2,30 +2,40 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"io"
 	"log"
 	"net"
 	"time"
 
+	"clio/internal/aof"
 	"clio/internal/command"
 	"clio/internal/resp"
 	"clio/internal/store"
 )
 
 func main() {
-	address := "localhost:6380"
-
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		log.Fatalf("failed to bind %s: %v", address, err)
-	}
-	defer listener.Close()
-
-	log.Printf("clio listening on %s", address)
+	address := flag.String("addr", "localhost:6380", "address to listen on")
+	aofPath := flag.String("aof", "clio.aof", "append-only file; empty disables persistence")
+	flag.Parse()
 
 	st := store.New()
 
+	var cmdLog command.Log
+	if *aofPath != "" {
+		cmdLog = loadAOF(st, *aofPath)
+	}
+	engine := command.NewEngine(st, cmdLog)
+
 	go sweepExpired(st)
+
+	listener, err := net.Listen("tcp", *address)
+	if err != nil {
+		log.Fatalf("failed to bind %s: %v", *address, err)
+	}
+	defer listener.Close()
+
+	log.Printf("clio listening on %s", *address)
 
 	for {
 		conn, err := listener.Accept()
@@ -33,8 +43,28 @@ func main() {
 			log.Printf("accept failed: %v", err)
 			continue
 		}
-		go handleConnection(conn, st)
+		go handleConnection(conn, engine)
 	}
+}
+
+func loadAOF(st *store.Store, path string) *aof.AOF {
+	replayer := command.NewEngine(st, nil)
+	n, err := aof.Replay(path, func(cmd resp.Value) error {
+		if reply := replayer.Execute(cmd); reply.Type == resp.Error {
+			return errors.New(reply.Str)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("failed to load %s after %d commands: %v", path, n, err)
+	}
+	log.Printf("loaded %d commands from %s", n, path)
+
+	file, err := aof.Open(path)
+	if err != nil {
+		log.Fatalf("failed to open %s: %v", path, err)
+	}
+	return file
 }
 
 func sweepExpired(st *store.Store) {
@@ -44,7 +74,7 @@ func sweepExpired(st *store.Store) {
 	}
 }
 
-func handleConnection(conn net.Conn, st *store.Store) {
+func handleConnection(conn net.Conn, engine *command.Engine) {
 	defer conn.Close()
 
 	client := conn.RemoteAddr().String()
@@ -72,7 +102,7 @@ func handleConnection(conn net.Conn, st *store.Store) {
 
 		log.Printf("%s sent: %v", client, cmd)
 
-		reply := command.Dispatch(st, cmd)
+		reply := engine.Execute(cmd)
 
 		if err := writer.WriteValue(reply); err != nil {
 			log.Printf("write to %s failed: %v", client, err)

@@ -90,7 +90,7 @@ func TestConcurrentAccess(t *testing.T) {
 
 func TestKeyExpires(t *testing.T) {
 	s, clock := newWithClock()
-	s.SetWithTTL("session", "abc", 10*time.Second)
+	s.SetWithDeadline("session", "abc", clock.Add(10*time.Second))
 
 	*clock = clock.Add(9 * time.Second)
 	if _, ok := s.Get("session"); !ok {
@@ -111,7 +111,7 @@ func TestKeyExpires(t *testing.T) {
 
 func TestSetClearsTTL(t *testing.T) {
 	s, clock := newWithClock()
-	s.SetWithTTL("name", "old", time.Second)
+	s.SetWithDeadline("name", "old", clock.Add(time.Second))
 	s.Set("name", "new")
 
 	*clock = clock.Add(time.Hour)
@@ -124,7 +124,7 @@ func TestSetClearsTTL(t *testing.T) {
 func TestTTL(t *testing.T) {
 	s, clock := newWithClock()
 	s.Set("plain", "x")
-	s.SetWithTTL("temp", "x", 10*time.Second)
+	s.SetWithDeadline("temp", "x", clock.Add(10*time.Second))
 	*clock = clock.Add(4 * time.Second)
 
 	if _, ok := s.TTL("ghost"); ok {
@@ -142,11 +142,11 @@ func TestExpireAndPersist(t *testing.T) {
 	s, clock := newWithClock()
 	s.Set("name", "Abheesht")
 
-	if s.Expire("ghost", time.Second) {
-		t.Errorf(`Expire("ghost") = true, want false`)
+	if s.ExpireAt("ghost", clock.Add(time.Second)) {
+		t.Errorf(`ExpireAt("ghost") = true, want false`)
 	}
-	if !s.Expire("name", 5*time.Second) {
-		t.Fatalf(`Expire("name") = false, want true`)
+	if !s.ExpireAt("name", clock.Add(5*time.Second)) {
+		t.Fatalf(`ExpireAt("name") = false, want true`)
 	}
 	if !s.Persist("name") {
 		t.Errorf(`Persist("name") = false, want true`)
@@ -160,20 +160,20 @@ func TestExpireAndPersist(t *testing.T) {
 		t.Errorf(`Get("name") after Persist: ok = false, want true`)
 	}
 
-	if !s.Expire("name", 0) {
-		t.Errorf(`Expire("name", 0) = false, want true`)
+	if !s.ExpireAt("name", *clock) {
+		t.Errorf(`ExpireAt("name", now) = false, want true`)
 	}
 	if _, ok := s.Get("name"); ok {
-		t.Errorf(`Get("name") after Expire 0: ok = true, want false`)
+		t.Errorf(`Get("name") after ExpireAt now: ok = true, want false`)
 	}
 }
 
 func TestDeleteExpired(t *testing.T) {
 	s, clock := newWithClock()
 	s.Set("keep", "x")
-	s.SetWithTTL("a", "x", time.Second)
-	s.SetWithTTL("b", "x", time.Second)
-	s.SetWithTTL("later", "x", time.Hour)
+	s.SetWithDeadline("a", "x", clock.Add(time.Second))
+	s.SetWithDeadline("b", "x", clock.Add(time.Second))
+	s.SetWithDeadline("later", "x", clock.Add(time.Hour))
 
 	*clock = clock.Add(2 * time.Second)
 	removed := s.DeleteExpired(100)
@@ -183,5 +183,16 @@ func TestDeleteExpired(t *testing.T) {
 	}
 	if len(s.data) != 2 {
 		t.Errorf("len(data) after sweep = %d, want 2", len(s.data))
+	}
+}
+
+func TestSetWithPastDeadlineDeletes(t *testing.T) {
+	s, clock := newWithClock()
+	s.Set("name", "old")
+
+	s.SetWithDeadline("name", "new", clock.Add(-time.Second))
+
+	if n := len(s.data); n != 0 {
+		t.Errorf("len(data) after past deadline = %d, want 0", n)
 	}
 }

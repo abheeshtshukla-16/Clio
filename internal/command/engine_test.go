@@ -1,6 +1,8 @@
 package command
 
 import (
+	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -45,6 +47,8 @@ func TestDispatch(t *testing.T) {
 		{name: "expire missing key", cmd: cmd("EXPIRE", "ghost", "10"), want: "(integer) 0"},
 		{name: "expire existing key", setup: map[string]string{"name": "A"}, cmd: cmd("EXPIRE", "name", "10"), want: "(integer) 1"},
 		{name: "expire non-number", setup: map[string]string{"name": "A"}, cmd: cmd("EXPIRE", "name", "x"), want: "(error) ERR value is not an integer or out of range"},
+		{name: "set with pxat in the past", setup: map[string]string{"name": "A"}, cmd: cmd("SET", "name", "B", "PXAT", "1000"), want: "+OK"},
+		{name: "pexpireat existing key", setup: map[string]string{"name": "A"}, cmd: cmd("PEXPIREAT", "name", "99999999999999"), want: "(integer) 1"},
 		{name: "persist without ttl", setup: map[string]string{"name": "A"}, cmd: cmd("PERSIST", "name"), want: "(integer) 0"},
 		{name: "unknown command", cmd: cmd("FOO"), want: "(error) ERR unknown command 'FOO'"},
 		{name: "get without key", cmd: cmd("GET"), want: "(error) ERR wrong number of arguments for 'get' command"},
@@ -60,28 +64,28 @@ func TestDispatch(t *testing.T) {
 				s.Set(k, v)
 			}
 
-			got := Dispatch(s, tc.cmd).String()
+			got := NewEngine(s, nil).Execute(tc.cmd).String()
 
 			if got != tc.want {
-				t.Errorf("Dispatch(%v) = %s, want %s", tc.cmd, got, tc.want)
+				t.Errorf("Execute(%v) = %s, want %s", tc.cmd, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestSetThenGetThroughDispatch(t *testing.T) {
-	s := store.New()
+func TestSetThenGet(t *testing.T) {
+	e := NewEngine(store.New(), nil)
 
-	Dispatch(s, cmd("SET", "name", "Abheesht"))
-	got := Dispatch(s, cmd("GET", "name")).String()
+	e.Execute(cmd("SET", "name", "Abheesht"))
+	got := e.Execute(cmd("GET", "name")).String()
 
 	if got != `"Abheesht"` {
 		t.Errorf("GET after SET = %s, want %q", got, "Abheesht")
 	}
 }
 
-func TestExpiryThroughDispatch(t *testing.T) {
-	s := store.New()
+func TestExpiry(t *testing.T) {
+	e := NewEngine(store.New(), nil)
 
 	steps := []struct {
 		cmd  resp.Value
@@ -100,19 +104,100 @@ func TestExpiryThroughDispatch(t *testing.T) {
 	}
 
 	for _, step := range steps {
-		if got := Dispatch(s, step.cmd).String(); got != step.want {
-			t.Fatalf("Dispatch(%v) = %s, want %s", step.cmd, got, step.want)
+		if got := e.Execute(step.cmd).String(); got != step.want {
+			t.Fatalf("Execute(%v) = %s, want %s", step.cmd, got, step.want)
 		}
 	}
 }
 
 func TestKeyExpiresInRealTime(t *testing.T) {
-	s := store.New()
+	e := NewEngine(store.New(), nil)
 
-	Dispatch(s, cmd("SET", "flash", "x", "PX", "20"))
+	e.Execute(cmd("SET", "flash", "x", "PX", "20"))
 	time.Sleep(40 * time.Millisecond)
 
-	if got := Dispatch(s, cmd("GET", "flash")).String(); got != "(nil)" {
+	if got := e.Execute(cmd("GET", "flash")).String(); got != "(nil)" {
 		t.Errorf("GET after PX expiry = %s, want (nil)", got)
+	}
+}
+
+type recordingLog struct {
+	entries [][]string
+	err     error
+}
+
+func (r *recordingLog) Append(args []string) error {
+	r.entries = append(r.entries, args)
+	return r.err
+}
+
+func TestWritesAreLogged(t *testing.T) {
+	log := &recordingLog{}
+	e := NewEngine(store.New(), log)
+
+	e.Execute(cmd("SET", "name", "A"))
+	e.Execute(cmd("GET", "name"))
+	e.Execute(cmd("DEL", "ghost"))
+	e.Execute(cmd("SET", "name"))
+	e.Execute(cmd("DEL", "name"))
+
+	want := [][]string{{"SET", "name", "A"}, {"DEL", "name"}}
+	if !slices.EqualFunc(log.entries, want, slices.Equal) {
+		t.Errorf("logged %q, want %q", log.entries, want)
+	}
+}
+
+func TestRelativeExpiryIsLoggedAsAbsolute(t *testing.T) {
+	log := &recordingLog{}
+	s := store.New()
+	e := NewEngine(s, log)
+
+	before := s.Now()
+	e.Execute(cmd("SET", "session", "abc", "EX", "100"))
+	e.Execute(cmd("EXPIRE", "session", "50"))
+
+	if len(log.entries) != 2 {
+		t.Fatalf("logged %d entries, want 2: %q", len(log.entries), log.entries)
+	}
+
+	set := log.entries[0]
+	if set[3] != "PXAT" {
+		t.Fatalf("SET logged as %q, want a PXAT form", set)
+	}
+	assertNear(t, set[4], before.Add(100*time.Second))
+
+	expire := log.entries[1]
+	if expire[0] != "PEXPIREAT" {
+		t.Fatalf("EXPIRE logged as %q, want PEXPIREAT", expire)
+	}
+	assertNear(t, expire[2], before.Add(50*time.Second))
+}
+
+func assertNear(t *testing.T, gotMillis string, want time.Time) {
+	t.Helper()
+	got := mustUnixMilli(t, gotMillis)
+	if diff := got.Sub(want); diff < -time.Second || diff > time.Second {
+		t.Errorf("deadline %v, want within 1s of %v", got, want)
+	}
+}
+
+func mustUnixMilli(t *testing.T, s string) time.Time {
+	t.Helper()
+	at, err := setDeadline(time.Time{}, "PXAT", s)
+	if err != nil {
+		t.Fatalf("bad timestamp %q: %v", s, err)
+	}
+	return at
+}
+
+func TestLogFailureIsReported(t *testing.T) {
+	log := &recordingLog{err: errors.New("disk full")}
+	e := NewEngine(store.New(), log)
+
+	got := e.Execute(cmd("SET", "name", "A")).String()
+
+	want := "(error) ERR write applied but not persisted: disk full"
+	if got != want {
+		t.Errorf("Execute(SET) with failing log = %s, want %s", got, want)
 	}
 }

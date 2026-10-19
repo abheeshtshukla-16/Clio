@@ -26,6 +26,10 @@ func New() *Store {
 	return &Store{data: make(map[string]entry), now: time.Now}
 }
 
+func (s *Store) Now() time.Time {
+	return s.now()
+}
+
 func (s *Store) live(key string) (entry, bool) {
 	e, ok := s.data[key]
 	if !ok || e.expired(s.now()) {
@@ -47,10 +51,14 @@ func (s *Store) Set(key, value string) {
 	s.data[key] = entry{value: value}
 }
 
-func (s *Store) SetWithTTL(key, value string, ttl time.Duration) {
+func (s *Store) SetWithDeadline(key, value string, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[key] = entry{value: value, expiresAt: s.now().Add(ttl)}
+	if !at.After(s.now()) {
+		delete(s.data, key)
+		return
+	}
+	s.data[key] = entry{value: value, expiresAt: at}
 }
 
 func (s *Store) Del(keys ...string) int {
@@ -78,18 +86,18 @@ func (s *Store) Exists(keys ...string) int {
 	return count
 }
 
-func (s *Store) Expire(key string, ttl time.Duration) bool {
+func (s *Store) ExpireAt(key string, at time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.live(key)
 	if !ok {
 		return false
 	}
-	if ttl <= 0 {
+	if !at.After(s.now()) {
 		delete(s.data, key)
 		return true
 	}
-	e.expiresAt = s.now().Add(ttl)
+	e.expiresAt = at
 	s.data[key] = e
 	return true
 }

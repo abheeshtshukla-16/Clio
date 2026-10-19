@@ -9,10 +9,10 @@ benchmarked against real Redis, with profiling (`pprof`) used to explain any
 performance gap.
 
 > **Status: early development.** The TCP server, the RESP protocol layer, a
-> concurrency-safe key-value store, a command dispatcher and key expiry are
-> working: `PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`, `EXISTS`, `EXPIRE`,
-> `TTL`, `PTTL` and `PERSIST` behave like Redis. Persistence and pub/sub are
-> next.
+> concurrency-safe key-value store, a command engine, key expiry and
+> append-only-file persistence are working: `PING`, `GET`, `SET` (with
+> `EX`/`PX`/`PXAT`), `DEL`, `EXISTS`, `EXPIRE`, `PEXPIREAT`, `TTL`, `PTTL` and
+> `PERSIST` behave like Redis, and data survives a restart. Pub/sub is next.
 
 ---
 
@@ -60,7 +60,13 @@ go run ./src
 ```
 
 The server listens on `localhost:6380` (6380 rather than Redis's usual 6379,
-so it never clashes with a real Redis instance).
+so it never clashes with a real Redis instance) and persists writes to
+`clio.aof` in the current directory.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-addr` | `localhost:6380` | address to listen on |
+| `-aof` | `clio.aof` | append-only file; `-aof ""` runs purely in memory |
 
 **Talk to it with netcat**, sending raw RESP bytes:
 
@@ -101,10 +107,11 @@ client connected: 127.0.0.1:54248
 | Command | Reply | Example |
 |---|---|---|
 | `PING [message]` | `PONG`, or the message echoed back | `PING` → `PONG` |
-| `SET key value [EX seconds \| PX milliseconds]` | `OK`; a plain `SET` removes any existing expiry | `SET session abc EX 60` → `OK` |
+| `SET key value [EX seconds \| PX milliseconds \| PXAT unix-ms]` | `OK`; a plain `SET` removes any existing expiry | `SET session abc EX 60` → `OK` |
 | `GET key` | the value, or `(nil)` if the key doesn't exist | `GET name` → `"Abheesht"` |
 | `DEL key [key ...]` | how many of the keys existed and were removed | `DEL name ghost` → `(integer) 1` |
 | `EXISTS key [key ...]` | how many of the keys exist (a repeated key counts each time) | `EXISTS name name ghost` → `(integer) 2` |
+| `PEXPIREAT key unix-ms` | like `EXPIRE`, but with an absolute deadline in Unix milliseconds | `PEXPIREAT name 1792424177805` → `(integer) 1` |
 | `EXPIRE key seconds` | `1` if the expiry was set, `0` if the key doesn't exist; `0` or a negative time deletes the key | `EXPIRE name 30` → `(integer) 1` |
 | `TTL key` | seconds left, `-1` if the key has no expiry, `-2` if it doesn't exist | `TTL session` → `(integer) 58` |
 | `PTTL key` | like `TTL`, in milliseconds | `PTTL session` → `(integer) 57980` |
@@ -164,10 +171,22 @@ without knowing which command produced it.
 
 ### The command layer
 
-`command.Dispatch(store, cmd)` takes one parsed command and returns one reply.
-It checks the command is an array of bulk strings, uppercases the name, looks
-it up in a table of commands, checks the argument count, and calls that
-command's handler. Handlers are the only code that touches the store.
+`engine.Execute(cmd)` takes one parsed command and returns one reply. It
+checks the command is an array of bulk strings, uppercases the name, looks it
+up in a table of commands, checks the argument count, and calls that command's
+handler. Handlers are the only code that touches the store.
+
+Each handler also returns a **log entry**: the command to write to the AOF, or
+nothing for reads and no-op writes. Write commands run under one engine lock,
+so the order of changes in the store is the order of lines in the file.
+
+### Persistence
+
+Every successful write is appended to `clio.aof` in RESP format, exactly the
+bytes a client would send. On startup the server replays the file through the
+same engine before accepting clients. Relative expiry is rewritten to absolute
+time before logging (`SET k v EX 100` becomes `SET k v PXAT 1792424177805`), so
+a replay hours later restores the right deadline.
 
 ### The store
 
@@ -225,12 +244,16 @@ Clio/
     │   ├── reader.go    bytes → Value (accepts both `$-1` and RESP3 `_` nulls)
     │   ├── reader_test.go
     │   └── writer.go    Value → bytes
+    ├── aof/             append-only-file persistence
+    │   ├── aof.go       Append, fsync every second, Replay
+    │   └── aof_test.go
     ├── store/           the concurrent key-value store
     │   ├── store.go     map + RWMutex: Get, Set, Del, Exists, expiry
     │   └── store_test.go
-    └── command/         the dispatcher
-        ├── dispatch.go  command table, argument checks, handlers
-        └── dispatch_test.go
+    └── command/         the command engine
+        ├── engine.go    Engine: parse, look up, check args, run, log
+        ├── commands.go  command table and handlers
+        └── engine_test.go
 ```
 
 **Why `internal/`?** Go enforces that packages under `internal/` can only be
@@ -248,14 +271,15 @@ As the project grows, sibling packages will join it:
 internal/
 ├── resp/      RESP encoding and decoding           ✅
 ├── store/     the concurrent key-value store      ✅
-├── command/   command dispatcher + handlers       ✅
-├── pubsub/    subscriptions and message fan-out   (planned)
-└── aof/       append-only-file persistence        (planned)
+├── command/   command engine + handlers           ✅
+├── aof/       append-only-file persistence        ✅
+└── pubsub/    subscriptions and message fan-out   (planned)
 ```
 
 The dependency direction is deliberate: `resp` and `store` depend on nothing
-else in the project; `command` uses both; `src/main.go` wires everything
-together.
+else in the project; `command` uses both; `aof` uses only `resp`;
+`src/main.go` wires everything together. The engine doesn't import `aof`: it
+depends on a one-method `Log` interface that `*aof.AOF` happens to satisfy.
 
 ---
 
@@ -372,11 +396,11 @@ is tested exactly and instantly, with no `sleep`.
 - *A min-heap ordered by expiry time:* finds the next key to expire exactly,
   but needs updating on every `SET`/`EXPIRE`/`PERSIST`.
 
-### The dispatcher: a command table
+### The engine: a command table
 
-**Chosen:** a map from command name to a `spec` (handler function plus
-minimum and maximum argument counts). `Dispatch` is a pure function, `Value`
-in and `Value` out, so it's tested without any network.
+**Chosen:** a map from command name to a `spec` (handler function, minimum and
+maximum argument counts, and whether it writes). `Execute` is `Value` in and
+`Value` out, so it's tested without any network.
 
 **Why:** adding a command is one handler and one table line; argument checks
 and error messages live in one place, so every command behaves consistently.
@@ -386,6 +410,33 @@ and error messages live in one place, so every command behaves consistently.
   grows long and can't carry per-command metadata.
 - *Handlers writing directly to the connection:* allows streaming large
   replies, but couples command logic to networking and makes tests harder.
+
+### Persistence: an append-only file in RESP
+
+**Chosen:** log every write command (an AOF), flushed to the OS on every
+write and fsynced to disk about once a second, then replay it on startup.
+
+**Why:** an append is the cheapest possible disk write (no seeking, no
+rewriting old data), and reusing RESP means the file needs no new format. The
+same `resp.Reader` that parses network input parses the file, and the same
+engine that serves clients rebuilds the data.
+
+**What can be lost:** a process crash (even `kill -9`) loses nothing, because
+each write has already been handed to the operating system. A machine crash or
+power cut can lose up to the last second, since that's how often the OS is
+told to put the data on the disk itself (`fsync`).
+
+**Known gaps, on purpose:** the file grows forever (real Redis periodically
+*rewrites* it into the shortest equivalent set of commands), and a half-written
+last command after a power cut is simply ignored on the next replay.
+
+**Rejected alternatives:**
+- *Snapshots (like Redis's RDB):* compact and fast to load, but anything since
+  the last snapshot is lost on a crash.
+- *fsync on every write:* nothing lost even on power failure, but every write
+  waits for the disk (milliseconds instead of microseconds).
+- *Logging the relative form (`EX 100`):* a replay would restart every
+  countdown from the moment of restart.
 
 ### Protocol errors close the connection
 
