@@ -12,7 +12,8 @@ performance gap.
 > concurrency-safe key-value store, a command engine, key expiry and
 > append-only-file persistence are working: `PING`, `GET`, `SET` (with
 > `EX`/`PX`/`PXAT`), `DEL`, `EXISTS`, `EXPIRE`, `PEXPIREAT`, `TTL`, `PTTL` and
-> `PERSIST` behave like Redis, and data survives a restart. Pub/sub is next.
+> `PERSIST` behave like Redis, and data survives a restart. Pub/sub works
+> with `SUBSCRIBE`, `UNSUBSCRIBE` and `PUBLISH`.
 
 ---
 
@@ -115,7 +116,18 @@ client connected: 127.0.0.1:54248
 | `EXPIRE key seconds` | `1` if the expiry was set, `0` if the key doesn't exist; `0` or a negative time deletes the key | `EXPIRE name 30` → `(integer) 1` |
 | `TTL key` | seconds left, `-1` if the key has no expiry, `-2` if it doesn't exist | `TTL session` → `(integer) 58` |
 | `PTTL key` | like `TTL`, in milliseconds | `PTTL session` → `(integer) 57980` |
+| `SUBSCRIBE channel [channel ...]` | one confirmation per channel, then a `message` array for every publish | `SUBSCRIBE news` → `subscribe news 1` |
+| `UNSUBSCRIBE [channel ...]` | one confirmation per channel; no arguments leaves every channel | `UNSUBSCRIBE` → `unsubscribe news 0` |
+| `PUBLISH channel message` | how many subscribers received it | `PUBLISH news hello` → `(integer) 1` |
 | `PERSIST key` | `1` if an expiry was removed, `0` otherwise | `PERSIST session` → `(integer) 1` |
+
+While a connection is subscribed it may only run `SUBSCRIBE`, `UNSUBSCRIBE`
+and `PING`, as in Redis. Try pub/sub with two terminals:
+
+```bash
+redis-cli -p 6380 SUBSCRIBE news          # terminal 1: waits for messages
+redis-cli -p 6380 PUBLISH news hello      # terminal 2: → (integer) 1
+```
 
 Command names are case-insensitive. An unknown command or a wrong number of
 arguments gets an error reply (`-ERR ...`) and the connection stays open.
@@ -180,6 +192,17 @@ Each handler also returns a **log entry**: the command to write to the AOF, or
 nothing for reads and no-op writes. Write commands run under one engine lock,
 so the order of changes in the store is the order of lines in the file.
 
+### Pub/sub
+
+`pubsub.Hub` maps each channel name to the set of subscribers listening on it.
+`PUBLISH` copies that set under a read lock, releases the lock, then writes the
+message to each subscriber. Each connection has exactly one writer, guarded by
+a mutex, because two goroutines now write to the same socket: the
+connection's own loop (replies) and any publisher (messages). Pub/sub commands
+are handled per connection in `src/conn.go`, since a subscription belongs to a
+connection, not to the keyspace. Messages are never stored or persisted: a
+subscriber that isn't connected simply misses them.
+
 ### Persistence
 
 Every successful write is appended to `clio.aof` in RESP format, exactly the
@@ -237,13 +260,18 @@ contain `\r\n` (or any bytes at all).
 Clio/
 ├── go.mod
 ├── src/
-│   └── main.go          TCP server: accept loop, one goroutine per connection
+│   ├── main.go          flags, AOF replay, expiry sweeper, accept loop
+│   ├── conn.go          one connection: read, handle (incl. pub/sub), reply
+│   └── conn_test.go     end-to-end tests over real TCP
 └── internal/
     ├── resp/            the RESP protocol (no networking, no command logic)
     │   ├── value.go     Value type, kinds, constructors, readable String()
     │   ├── reader.go    bytes → Value (accepts both `$-1` and RESP3 `_` nulls)
     │   ├── reader_test.go
     │   └── writer.go    Value → bytes
+    ├── pubsub/          channels → subscribers, message fan-out
+    │   ├── pubsub.go    Hub (Subscribe, Unsubscribe, Publish), Subscriber
+    │   └── pubsub_test.go
     ├── aof/             append-only-file persistence
     │   ├── aof.go       Append, fsync every second, Replay
     │   └── aof_test.go
@@ -273,7 +301,7 @@ internal/
 ├── store/     the concurrent key-value store      ✅
 ├── command/   command engine + handlers           ✅
 ├── aof/       append-only-file persistence        ✅
-└── pubsub/    subscriptions and message fan-out   (planned)
+└── pubsub/    subscriptions and message fan-out   ✅
 ```
 
 The dependency direction is deliberate: `resp` and `store` depend on nothing
@@ -437,6 +465,27 @@ last command after a power cut is simply ignored on the next replay.
   waits for the disk (milliseconds instead of microseconds).
 - *Logging the relative form (`EX 100`):* a replay would restart every
   countdown from the moment of restart.
+
+### Pub/sub: a hub and a locked writer per connection
+
+**Chosen:** a `map[channel]set-of-subscribers` behind an `RWMutex`. Publishing
+takes a snapshot of the set, releases the lock, and writes to each subscriber
+directly from the publisher's goroutine; a per-connection mutex keeps replies
+and messages from interleaving on the wire.
+
+**Why:** it's the least code that is correct. The lock is never held during
+network writes, so a slow subscriber can't freeze the whole hub.
+
+**Trade-off accepted:** a subscriber whose socket is full makes `PUBLISH` wait
+for it. Real Redis buffers output per client and disconnects clients whose
+buffer grows past a limit.
+
+**Rejected alternatives:**
+- *A writer goroutine per connection, fed by a channel:* publishers never
+  wait (drop or disconnect when the channel is full), at the cost of another
+  goroutine and a channel hop on every reply.
+- *A Go channel per pub/sub channel:* a Go channel delivers each value to one
+  receiver, not to all of them, so fan-out would still need a loop.
 
 ### Protocol errors close the connection
 

@@ -3,13 +3,13 @@ package main
 import (
 	"errors"
 	"flag"
-	"io"
 	"log"
 	"net"
 	"time"
 
 	"clio/internal/aof"
 	"clio/internal/command"
+	"clio/internal/pubsub"
 	"clio/internal/resp"
 	"clio/internal/store"
 )
@@ -26,6 +26,7 @@ func main() {
 		cmdLog = loadAOF(st, *aofPath)
 	}
 	engine := command.NewEngine(st, cmdLog)
+	hub := pubsub.NewHub()
 
 	go sweepExpired(st)
 
@@ -43,7 +44,7 @@ func main() {
 			log.Printf("accept failed: %v", err)
 			continue
 		}
-		go handleConnection(conn, engine)
+		go handleConnection(conn, engine, hub)
 	}
 }
 
@@ -72,47 +73,4 @@ func sweepExpired(st *store.Store) {
 		for st.DeleteExpired(20) > 5 {
 		}
 	}
-}
-
-func handleConnection(conn net.Conn, engine *command.Engine) {
-	defer conn.Close()
-
-	client := conn.RemoteAddr().String()
-	log.Printf("client connected: %s", client)
-
-	reader := resp.NewReader(conn)
-
-	writer := resp.NewWriter(conn)
-
-	for {
-		cmd, err := reader.ReadValue()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if errors.Is(err, resp.ErrProtocol) {
-			writer.WriteValue(resp.Err("ERR " + err.Error()))
-			writer.Flush()
-			log.Printf("%s sent invalid RESP: %v", client, err)
-			return
-		}
-		if err != nil {
-			log.Printf("read from %s failed: %v", client, err)
-			return
-		}
-
-		log.Printf("%s sent: %v", client, cmd)
-
-		reply := engine.Execute(cmd)
-
-		if err := writer.WriteValue(reply); err != nil {
-			log.Printf("write to %s failed: %v", client, err)
-			return
-		}
-
-		if err := writer.Flush(); err != nil {
-			log.Printf("write to %s failed: %v", client, err)
-			return
-		}
-	}
-	log.Printf("client disconnected: %s", client)
 }

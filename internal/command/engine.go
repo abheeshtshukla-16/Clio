@@ -33,7 +33,7 @@ func NewEngine(s *store.Store, log Log) *Engine {
 }
 
 func (e *Engine) Execute(cmd resp.Value) resp.Value {
-	args, ok := toStrings(cmd)
+	args, ok := Args(cmd)
 	if !ok {
 		return resp.Err("ERR commands must be an array of bulk strings")
 	}
@@ -70,7 +70,7 @@ func (e *Engine) Execute(cmd resp.Value) resp.Value {
 	return reply
 }
 
-func toStrings(cmd resp.Value) ([]string, bool) {
+func Args(cmd resp.Value) ([]string, bool) {
 	if cmd.Type != resp.Array {
 		return nil, false
 	}
