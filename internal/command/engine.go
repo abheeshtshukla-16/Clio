@@ -11,6 +11,7 @@ import (
 
 type Log interface {
 	Append(args []string) error
+	Flush() error
 }
 
 type handler func(s *store.Store, args []string) (resp.Value, []string)
@@ -68,6 +69,13 @@ func (e *Engine) Execute(cmd resp.Value) resp.Value {
 		}
 	}
 	return reply
+}
+
+func (e *Engine) FlushLog() error {
+	if e.log == nil {
+		return nil
+	}
+	return e.log.Flush()
 }
 
 func Args(cmd resp.Value) ([]string, bool) {

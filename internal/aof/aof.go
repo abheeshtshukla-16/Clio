@@ -39,10 +39,13 @@ func (a *AOF) Append(args []string) error {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if err := a.w.WriteValue(resp.Arr(vals...)); err != nil {
-		return err
-	}
 	a.dirty = true
+	return a.w.WriteValue(resp.Arr(vals...))
+}
+
+func (a *AOF) Flush() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return a.w.Flush()
 }
 
@@ -65,10 +68,11 @@ func (a *AOF) sync() error {
 	a.mu.Lock()
 	dirty := a.dirty
 	a.dirty = false
+	err := a.w.Flush()
 	a.mu.Unlock()
 
-	if !dirty {
-		return nil
+	if err != nil || !dirty {
+		return err
 	}
 	return a.file.Sync()
 }

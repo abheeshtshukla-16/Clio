@@ -68,3 +68,19 @@ func TestReplayStopsAtIncompleteCommand(t *testing.T) {
 		t.Errorf("Replay(torn file) = %d, %v, want 1, nil", n, err)
 	}
 }
+
+func TestAppendIsBufferedUntilFlush(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clio.aof")
+	a, _ := Open(path)
+	defer a.Close()
+
+	a.Append([]string{"SET", "k", "v"})
+	if data, _ := os.ReadFile(path); len(data) != 0 {
+		t.Fatalf("file has %q before Flush, want nothing", data)
+	}
+
+	a.Flush()
+	if data, _ := os.ReadFile(path); len(data) == 0 {
+		t.Errorf("file is empty after Flush")
+	}
+}

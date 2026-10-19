@@ -5,6 +5,8 @@ import (
 	"flag"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"time"
 
 	"clio/internal/aof"
@@ -17,7 +19,15 @@ import (
 func main() {
 	address := flag.String("addr", "localhost:6380", "address to listen on")
 	aofPath := flag.String("aof", "clio.aof", "append-only file; empty disables persistence")
+	pprofAddr := flag.String("pprof", "", "serve profiling data on this address, e.g. localhost:6060")
 	flag.Parse()
+
+	if *pprofAddr != "" {
+		go func() {
+			log.Printf("pprof on http://%s/debug/pprof/", *pprofAddr)
+			log.Println(http.ListenAndServe(*pprofAddr, nil))
+		}()
+	}
 
 	st := store.New()
 

@@ -24,6 +24,10 @@ func NewReader(r io.Reader) *Reader {
 	return &Reader{br: bufio.NewReader(r)}
 }
 
+func (r *Reader) Buffered() int {
+	return r.br.Buffered()
+}
+
 func (r *Reader) ReadValue() (Value, error) {
 	prefix, err := r.br.ReadByte()
 	if err != nil {

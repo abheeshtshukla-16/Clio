@@ -54,6 +54,17 @@ func handleConnection(conn net.Conn, engine *command.Engine, hub *pubsub.Hub) {
 			log.Printf("write to %s failed: %v", client, err)
 			return
 		}
+
+		if reader.Buffered() == 0 {
+			if err := s.engine.FlushLog(); err != nil {
+				log.Printf("aof write failed, dropping %s: %v", client, err)
+				return
+			}
+			if err := s.out.Flush(); err != nil {
+				log.Printf("write to %s failed: %v", client, err)
+				return
+			}
+		}
 	}
 	log.Printf("client disconnected: %s", client)
 }
@@ -61,7 +72,7 @@ func handleConnection(conn net.Conn, engine *command.Engine, hub *pubsub.Hub) {
 func (s *session) handle(cmd resp.Value) error {
 	args, ok := command.Args(cmd)
 	if !ok || len(args) == 0 {
-		return s.out.Send(s.engine.Execute(cmd))
+		return s.out.Queue(s.engine.Execute(cmd))
 	}
 
 	name := strings.ToUpper(args[0])
@@ -72,25 +83,25 @@ func (s *session) handle(cmd resp.Value) error {
 		return s.unsubscribe(args[1:])
 	case "PUBLISH":
 		if len(args) != 3 {
-			return s.out.Send(resp.Err("ERR wrong number of arguments for 'publish' command"))
+			return s.out.Queue(resp.Err("ERR wrong number of arguments for 'publish' command"))
 		}
-		return s.out.Send(resp.Int(int64(s.hub.Publish(args[1], args[2]))))
+		return s.out.Queue(resp.Int(int64(s.hub.Publish(args[1], args[2]))))
 	}
 
 	if len(s.channels) > 0 && name != "PING" {
-		return s.out.Send(resp.Err("ERR only SUBSCRIBE, UNSUBSCRIBE and PING are allowed while subscribed"))
+		return s.out.Queue(resp.Err("ERR only SUBSCRIBE, UNSUBSCRIBE and PING are allowed while subscribed"))
 	}
-	return s.out.Send(s.engine.Execute(cmd))
+	return s.out.Queue(s.engine.Execute(cmd))
 }
 
 func (s *session) subscribe(channels []string) error {
 	if len(channels) == 0 {
-		return s.out.Send(resp.Err("ERR wrong number of arguments for 'subscribe' command"))
+		return s.out.Queue(resp.Err("ERR wrong number of arguments for 'subscribe' command"))
 	}
 	for _, ch := range channels {
 		alreadySubscribed := s.channels[ch]
 		s.channels[ch] = true
-		if err := s.out.Send(confirmation("subscribe", ch, len(s.channels))); err != nil {
+		if err := s.out.Queue(confirmation("subscribe", ch, len(s.channels))); err != nil {
 			return err
 		}
 		if !alreadySubscribed {
@@ -107,14 +118,14 @@ func (s *session) unsubscribe(channels []string) error {
 		}
 	}
 	if len(channels) == 0 {
-		return s.out.Send(resp.Arr(resp.Bulk("unsubscribe"), resp.NullValue(), resp.Int(0)))
+		return s.out.Queue(resp.Arr(resp.Bulk("unsubscribe"), resp.NullValue(), resp.Int(0)))
 	}
 	for _, ch := range channels {
 		if s.channels[ch] {
 			delete(s.channels, ch)
 			s.hub.Unsubscribe(s.out, ch)
 		}
-		if err := s.out.Send(confirmation("unsubscribe", ch, len(s.channels))); err != nil {
+		if err := s.out.Queue(confirmation("unsubscribe", ch, len(s.channels))); err != nil {
 			return err
 		}
 	}

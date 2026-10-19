@@ -18,12 +18,31 @@ func NewSubscriber(w *resp.Writer) *Subscriber {
 func (s *Subscriber) Send(vals ...resp.Value) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.write(vals); err != nil {
+		return err
+	}
+	return s.w.Flush()
+}
+
+func (s *Subscriber) Queue(vals ...resp.Value) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.write(vals)
+}
+
+func (s *Subscriber) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Flush()
+}
+
+func (s *Subscriber) write(vals []resp.Value) error {
 	for _, v := range vals {
 		if err := s.w.WriteValue(v); err != nil {
 			return err
 		}
 	}
-	return s.w.Flush()
+	return nil
 }
 
 type Hub struct {

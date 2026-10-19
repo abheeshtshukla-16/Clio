@@ -131,6 +131,10 @@ func (r *recordingLog) Append(args []string) error {
 	return r.err
 }
 
+func (r *recordingLog) Flush() error {
+	return nil
+}
+
 func TestWritesAreLogged(t *testing.T) {
 	log := &recordingLog{}
 	e := NewEngine(store.New(), log)
