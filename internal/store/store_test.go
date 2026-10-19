@@ -48,6 +48,17 @@ func TestDel(t *testing.T) {
 	}
 }
 
+func TestExists(t *testing.T) {
+	s := New()
+	s.Set("name", "Abheesht")
+
+	count := s.Exists("name", "name", "ghost")
+
+	if count != 2 {
+		t.Errorf("Exists(name, name, ghost) = %d, want 2", count)
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	s := New()
 

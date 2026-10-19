@@ -10,7 +10,7 @@ performance gap.
 
 > **Status: early development.** The TCP server, the RESP protocol layer, a
 > concurrency-safe key-value store and a command dispatcher are working:
-> `PING`, `GET`, `SET` and `DEL` behave like Redis. Expiry, persistence and
+> `PING`, `GET`, `SET`, `DEL` and `EXISTS` behave like Redis. Expiry, persistence and
 > pub/sub are next.
 
 ---
@@ -103,6 +103,7 @@ client connected: 127.0.0.1:54248
 | `SET key value` | `OK` | `SET name Abheesht` → `OK` |
 | `GET key` | the value, or `(nil)` if the key doesn't exist | `GET name` → `"Abheesht"` |
 | `DEL key [key ...]` | how many of the keys existed and were removed | `DEL name ghost` → `(integer) 1` |
+| `EXISTS key [key ...]` | how many of the keys exist (a repeated key counts each time) | `EXISTS name name ghost` → `(integer) 2` |
 
 Command names are case-insensitive. An unknown command or a wrong number of
 arguments gets an error reply (`-ERR ...`) and the connection stays open.
@@ -215,12 +216,15 @@ Clio/
 └── internal/
     ├── resp/            the RESP protocol (no networking, no command logic)
     │   ├── value.go     Value type, kinds, constructors, readable String()
-    │   ├── reader.go    bytes → Value
+    │   ├── reader.go    bytes → Value (accepts both `$-1` and RESP3 `_` nulls)
+    │   ├── reader_test.go
     │   └── writer.go    Value → bytes
     ├── store/           the concurrent key-value store
-    │   └── store.go     map + RWMutex: Get, Set, Del, Exists
+    │   ├── store.go     map + RWMutex: Get, Set, Del, Exists
+    │   └── store_test.go
     └── command/         the dispatcher
-        └── dispatch.go  command table, argument checks, handlers
+        ├── dispatch.go  command table, argument checks, handlers
+        └── dispatch_test.go
 ```
 
 **Why `internal/`?** Go enforces that packages under `internal/` can only be

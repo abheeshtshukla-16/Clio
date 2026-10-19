@@ -28,14 +28,12 @@ func (w *Writer) WriteValue(v Value) error {
 		_, err = fmt.Fprintf(w.bw, ":%d\r\n", v.Int)
 
 	case BulkString:
-
 		_, err = fmt.Fprintf(w.bw, "$%d\r\n%s\r\n", len(v.Str), v.Str)
 
 	case Null:
 		_, err = fmt.Fprint(w.bw, "$-1\r\n")
 
 	case Array:
-
 		if _, err = fmt.Fprintf(w.bw, "*%d\r\n", len(v.Array)); err != nil {
 			return err
 		}

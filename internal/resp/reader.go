@@ -23,6 +23,7 @@ type Reader struct {
 func NewReader(r io.Reader) *Reader {
 	return &Reader{br: bufio.NewReader(r)}
 }
+
 func (r *Reader) ReadValue() (Value, error) {
 	prefix, err := r.br.ReadByte()
 	if err != nil {
@@ -56,6 +57,16 @@ func (r *Reader) ReadValue() (Value, error) {
 
 	case Array:
 		return r.readArray()
+
+	case Null:
+		line, err := r.readLine()
+		if err != nil {
+			return Value{}, err
+		}
+		if line != "" {
+			return Value{}, fmt.Errorf("%w: null must be empty, got %q", ErrProtocol, line)
+		}
+		return NullValue(), nil
 
 	default:
 		return Value{}, fmt.Errorf("%w: unexpected type byte %q", ErrProtocol, prefix)

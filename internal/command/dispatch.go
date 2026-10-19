@@ -17,10 +17,11 @@ type spec struct {
 }
 
 var commands = map[string]spec{
-	"PING": {run: handlePing, minArgs: 0, maxArgs: 1},
-	"GET":  {run: handleGet, minArgs: 1, maxArgs: 1},
-	"SET":  {run: handleSet, minArgs: 2, maxArgs: 2},
-	"DEL":  {run: handleDel, minArgs: 1, maxArgs: -1},
+	"PING":   {run: handlePing, minArgs: 0, maxArgs: 1},
+	"GET":    {run: handleGet, minArgs: 1, maxArgs: 1},
+	"SET":    {run: handleSet, minArgs: 2, maxArgs: 2},
+	"DEL":    {run: handleDel, minArgs: 1, maxArgs: -1},
+	"EXISTS": {run: handleExists, minArgs: 1, maxArgs: -1},
 }
 
 func Dispatch(s *store.Store, cmd resp.Value) resp.Value {
@@ -85,4 +86,9 @@ func handleSet(s *store.Store, args []string) resp.Value {
 func handleDel(s *store.Store, args []string) resp.Value {
 	removed := s.Del(args...)
 	return resp.Int(int64(removed))
+}
+
+func handleExists(s *store.Store, args []string) resp.Value {
+	count := s.Exists(args...)
+	return resp.Int(int64(count))
 }

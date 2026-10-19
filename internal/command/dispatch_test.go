@@ -29,6 +29,8 @@ func TestDispatch(t *testing.T) {
 		{name: "get missing", cmd: cmd("GET", "city"), want: "(nil)"},
 		{name: "lowercase name", setup: map[string]string{"name": "Abheesht"}, cmd: cmd("get", "name"), want: `"Abheesht"`},
 		{name: "del counts existing only", setup: map[string]string{"name": "A", "city": "Pune"}, cmd: cmd("DEL", "name", "city", "ghost"), want: "(integer) 2"},
+		{name: "exists counts repeats", setup: map[string]string{"name": "A"}, cmd: cmd("EXISTS", "name", "name", "ghost"), want: "(integer) 2"},
+		{name: "exists without key", cmd: cmd("EXISTS"), want: "(error) ERR wrong number of arguments for 'exists' command"},
 		{name: "unknown command", cmd: cmd("FOO"), want: "(error) ERR unknown command 'FOO'"},
 		{name: "get without key", cmd: cmd("GET"), want: "(error) ERR wrong number of arguments for 'get' command"},
 		{name: "set with one arg", cmd: cmd("SET", "name"), want: "(error) ERR wrong number of arguments for 'set' command"},
